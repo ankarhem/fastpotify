@@ -61,7 +61,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let inset = theme::titlebar_inset(ui.ctx());
     let content_height = theme::TOP_BAR_HEIGHT + inset;
     let height = content_height + window_controls.topbar_top;
-    super::titlebar_drag(
+    super::titlebar_interaction(
         ui,
         egui::Rect::from_min_size(ui.cursor().min, vec2(width, height)),
     );

@@ -158,34 +158,125 @@ fn central(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-/// Makes `rect` drag the borderless window. Register it before child widgets so
-/// they keep their clicks.
-pub fn titlebar_drag(ui: &mut egui::Ui, rect: egui::Rect) {
+/// What a press on the title bar does, decided on the press itself the way
+/// AppKit decides at mouse-down.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TitlebarPress {
+    /// Drag the window.
+    Drag,
+    /// The press completes a double-click: zoom the window.
+    Zoom,
+}
+
+/// Reads a title-bar press and returns what it does and the press the next
+/// one should pair with. egui counts double-clicks on release, but on macOS
+/// the press starts an AppKit drag session that can swallow the release, so
+/// the pairing runs press to press instead, like AppKit's own click counting,
+/// and the zoom lands on the second press rather than on its release. A
+/// completed pair is spent: a third quick press drags again rather than
+/// zooming a second time.
+fn titlebar_press(
+    now: f64,
+    pos: egui::Pos2,
+    previous: Option<(f64, egui::Pos2)>,
+    double_click_delay: f64,
+    double_click_dist: f32,
+) -> (TitlebarPress, Option<(f64, egui::Pos2)>) {
+    match previous {
+        Some((then, at))
+            if now - then <= double_click_delay && at.distance(pos) <= double_click_dist =>
+        {
+            (TitlebarPress::Zoom, None)
+        }
+        _ => (TitlebarPress::Drag, Some((now, pos))),
+    }
+}
+
+/// Remembers a title-bar press for the next one to pair with. The store is
+/// keyed by type as well as id, so a spent pair removes the entry instead of
+/// writing an `Option` a differently typed read would never find.
+fn remember_titlebar_press(ctx: &egui::Context, id: egui::Id, press: Option<(f64, egui::Pos2)>) {
+    ctx.data_mut(|data| match press {
+        Some(at) => {
+            data.insert_temp(id, at);
+        }
+        None => data.remove::<(f64, egui::Pos2)>(id),
+    });
+}
+
+/// The press the next title-bar press pairs with, if one is remembered.
+fn last_titlebar_press(ctx: &egui::Context, id: egui::Id) -> Option<(f64, egui::Pos2)> {
+    ctx.data(|data| data.get_temp(id))
+}
+
+/// Zooms the window. On macOS the zoom steps the window itself, one plain
+/// resize at a time, because the toolkit's command animates on the window
+/// server, from a snapshot of the window, which stretches the interface
+/// (src/mac_window.rs); everywhere else the toolkit's maximize does the
+/// job, restoring the size and position the window had before.
+fn zoom_window(_ctx: &egui::Context) {
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac_window::toggle();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let maximized = _ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+        _ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+    }
+}
+
+/// Makes `rect` the window's title bar: a press drags it, a double-click
+/// zooms it. Register it before child widgets so they keep their clicks.
+pub fn titlebar_interaction(ui: &mut egui::Ui, rect: egui::Rect) {
+    let app_owns_titlebar = cfg!(any(target_os = "macos", windows));
     let fullscreen = ui
         .ctx()
         .input(|input| input.viewport().fullscreen.unwrap_or(false));
-    if !cfg!(any(target_os = "macos", windows)) || fullscreen {
+    if !app_owns_titlebar || fullscreen {
         return;
     }
     let response = ui.interact(
         rect,
-        ui.id().with("titlebar-drag"),
+        ui.id().with("titlebar"),
         egui::Sense::click_and_drag(),
     );
-    if cfg!(windows) && response.double_clicked() {
-        let maximized = ui
-            .ctx()
-            .input(|input| input.viewport().maximized.unwrap_or(false));
-        ui.ctx()
-            .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-    } else if cfg!(windows) && response.drag_started() {
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-    } else if cfg!(target_os = "macos")
-        && response.is_pointer_button_down_on()
-        && ui.input(|input| input.pointer.primary_pressed())
-    {
+    let gesture = if cfg!(target_os = "macos") {
         // macOS needs the live mouse-down event rather than egui's drag threshold.
-        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        if response.is_pointer_button_down_on() && ui.input(|input| input.pointer.primary_pressed())
+        {
+            let Some(pos) = ui.input(|input| input.pointer.interact_pos()) else {
+                return;
+            };
+            let id = ui.id().with("titlebar-press");
+            let previous = last_titlebar_press(ui.ctx(), id);
+            let (double_click_delay, double_click_dist) = ui.ctx().options(|options| {
+                (
+                    options.input_options.max_double_click_delay,
+                    options.input_options.max_click_dist,
+                )
+            });
+            let now = ui.input(|input| input.time);
+            let (gesture, remember) =
+                titlebar_press(now, pos, previous, double_click_delay, double_click_dist);
+            remember_titlebar_press(ui.ctx(), id, remember);
+            Some(gesture)
+        } else {
+            None
+        }
+    } else if response.double_clicked() {
+        Some(TitlebarPress::Zoom)
+    } else if response.drag_started() {
+        Some(TitlebarPress::Drag)
+    } else {
+        None
+    };
+    match gesture {
+        Some(TitlebarPress::Drag) => {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        Some(TitlebarPress::Zoom) => zoom_window(ui.ctx()),
+        None => {}
     }
 }
 
@@ -420,6 +511,76 @@ fn toasts(app: &mut App, ctx: &egui::Context, bottom_offset: f32) {
                     });
             }
         });
+}
+
+#[cfg(test)]
+mod titlebar_press_tests {
+    use super::*;
+
+    /// egui's own limits: a double-click within 0.3 s and 6 points.
+    const DELAY: f64 = 0.3;
+    const DIST: f32 = 6.0;
+
+    fn press(
+        now: f64,
+        pos: egui::Pos2,
+        previous: Option<(f64, egui::Pos2)>,
+    ) -> (TitlebarPress, Option<(f64, egui::Pos2)>) {
+        titlebar_press(now, pos, previous, DELAY, DIST)
+    }
+
+    #[test]
+    fn a_press_without_a_partner_drags_and_is_remembered() {
+        let (gesture, remember) = press(1.0, egui::pos2(10.0, 5.0), None);
+        assert_eq!(gesture, TitlebarPress::Drag);
+        assert_eq!(remember, Some((1.0, egui::pos2(10.0, 5.0))));
+    }
+
+    #[test]
+    fn the_second_press_of_a_quick_pair_in_place_zooms_and_spends_the_pair() {
+        let (gesture, remember) = press(
+            1.1,
+            egui::pos2(12.0, 6.0),
+            Some((1.0, egui::pos2(10.0, 5.0))),
+        );
+        assert_eq!(gesture, TitlebarPress::Zoom);
+        assert_eq!(remember, None);
+    }
+
+    #[test]
+    fn a_press_after_the_double_click_window_drags() {
+        let (gesture, _) = press(
+            1.4,
+            egui::pos2(10.0, 5.0),
+            Some((1.0, egui::pos2(10.0, 5.0))),
+        );
+        assert_eq!(gesture, TitlebarPress::Drag);
+    }
+
+    #[test]
+    fn a_press_far_from_its_partner_drags() {
+        let (gesture, _) = press(
+            1.1,
+            egui::pos2(100.0, 5.0),
+            Some((1.0, egui::pos2(10.0, 5.0))),
+        );
+        assert_eq!(gesture, TitlebarPress::Drag);
+    }
+
+    /// The store and its reader must agree on the type they keep, or a
+    /// written press is never read back and no press ever pairs.
+    #[test]
+    fn a_remembered_press_round_trips_and_a_spent_pair_is_forgotten() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("titlebar-press-test");
+        remember_titlebar_press(&ctx, id, Some((1.0, egui::pos2(10.0, 5.0))));
+        assert_eq!(
+            last_titlebar_press(&ctx, id),
+            Some((1.0, egui::pos2(10.0, 5.0)))
+        );
+        remember_titlebar_press(&ctx, id, None);
+        assert_eq!(last_titlebar_press(&ctx, id), None);
+    }
 }
 
 #[cfg(test)]
