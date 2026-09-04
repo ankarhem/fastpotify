@@ -17,6 +17,8 @@ pub mod lyrics;
 pub mod mac_links;
 #[cfg(target_os = "macos")]
 pub mod mac_menu;
+#[cfg(target_os = "macos")]
+pub mod mac_window;
 pub mod media;
 #[cfg(target_os = "linux")]
 #[path = "mpris.rs"]

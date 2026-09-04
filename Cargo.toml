@@ -113,12 +113,15 @@ souvlaki = { version = "0.8", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Serving AppKit while no window exists: the status item and Dock reopen
-# callback live on the main thread.
+# callback live on the main thread. The main window's zoom is AppKit too:
+# the toolkit's zoom animates by scaling the last drawn frame
+# (src/mac_window.rs).
 objc2 = "0.6"
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSAccessibility", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSScreen", "NSWindow", "NSWorkspace"] }
 # NSAppleEventManager and NSAppleEventDescriptor carry the Spotify links
-# macOS hands an app registered for the scheme (src/mac_links.rs).
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSDate", "NSObjCRuntime", "NSRunLoop", "NSString"] }
+# macOS hands an app registered for the scheme (src/mac_links.rs). NSTimer
+# steps the main window's zoom (src/mac_window.rs).
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventDescriptor", "NSAppleEventManager", "NSDate", "NSGeometry", "NSObjCRuntime", "NSRunLoop", "NSString", "NSTimer"] }
 
 [target.'cfg(windows)'.dependencies]
 # A hidden window for the media controls to belong to, and message loops.
